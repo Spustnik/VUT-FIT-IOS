@@ -1,0 +1,352 @@
+#include <ctype.h>
+#include <semaphore.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ipc.h>
+#include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef struct queue {
+  sem_t semaphore;
+  int customers_in_queue;
+  sem_t id;
+} queue_t;
+
+typedef struct shared {
+  queue_t queue[3];
+  sem_t cus;
+  sem_t off;
+  sem_t begin;
+  sem_t out;
+  sem_t post_lock;
+  sem_t print_lock;
+  int service_type;
+  int cus_num;
+  int off_num;
+  size_t rows;
+  FILE *file_op;
+  bool post_office;
+
+} shared_t;
+int sem_value;
+
+#define MMAP(pointer)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  \
+  { (pointer) = mmap(NULL, sizeof(*(pointer)), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); }
+#define UNMAP(pointer)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 \
+  { munmap((pointer), sizeof((pointer))); }
+
+bool inRange(int a, int b, int c) {
+  if (a <= b && b >= c)
+    return true;
+  else
+    return false;
+}
+void cleanup_memory(shared_t *shared) { munmap(shared, sizeof(shared_t)); }
+
+void init_semaphores(shared_t *shared) {
+  sem_init(&(shared->out), 1, 1);
+  sem_init(&(shared->post_lock), 1, 1);
+  sem_init(&(shared->print_lock), 1, 1);
+  sem_init(&(shared->begin), 1, 0);
+  sem_init(&(shared->cus), 1, 1);
+  sem_init(&(shared->off), 1, 1);
+
+  for (int i = 0; i < 3; i++) {
+    sem_init(&shared->queue[i].id, 1, 1);
+    sem_init(&shared->queue[i].semaphore, 1, 0);
+    shared->queue[i].customers_in_queue = 0;
+  }
+}
+
+void destroy_semaphores(shared_t *shared) {
+  sem_destroy(&(shared->out));
+  sem_destroy(&(shared->begin));
+  sem_destroy(&(shared->post_lock));
+  sem_destroy(&(shared->print_lock));
+  sem_destroy(&(shared->cus));
+  sem_destroy(&(shared->off));
+  cleanup_memory(shared);
+}
+void rand_sleep(int time) { usleep((rand() % (time + 1))); }
+
+bool read_post_office(shared_t *shared) {
+  sem_wait(&shared->post_lock);
+  // check if post office is open
+  bool is_post_office_open = shared->post_office;
+  if (is_post_office_open == false) {
+    sem_post(&shared->post_lock);
+  }
+  return is_post_office_open;
+}
+int check_queue(shared_t *shared) {
+  int j = 0;
+  int full_queue[3];
+  // check if there are any customers in queue
+  for (int i = 0; i < 3; i++) {
+    sem_wait(&shared->queue[i].id);
+    if (shared->queue[i].customers_in_queue > 0) {
+      full_queue[j] = i;
+      j++;
+    }
+  }
+  // if there are customers in queue, choose one randomly
+  int queue_order = j > 0 ? full_queue[(rand() % j)] : -1;
+  if (queue_order != -1) {
+    shared->queue[queue_order].customers_in_queue--;
+  }
+  // unlock all queues
+  for (int i = 0; i < 3; i++) {
+    sem_post(&shared->queue[i].id);
+  }
+  return queue_order;
+}
+
+// printing to file
+void print_to_file(shared_t *shared, int id, char customer, int action) {
+  // one process at a time
+  sem_wait(&shared->out);
+  sem_wait(&shared->print_lock);
+  switch (action) {
+  case 0:
+    fprintf(shared->file_op, "%ld: %c %d: started\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 1:
+    fprintf(shared->file_op, "%ld: %c %d: entering office for a service 1\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 2:
+    fprintf(shared->file_op, "%ld: %c %d: entering office for a service 2\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 3:
+    fprintf(shared->file_op, "%ld: %c %d: entering office for a service 3\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 4:
+    fprintf(shared->file_op, "%ld: %c %d: called by office worker\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 5:
+    fprintf(shared->file_op, "%ld: %c %d: serving a service of type 1\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 6:
+    fprintf(shared->file_op, "%ld: %c %d: serving a service of type 2\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 7:
+    fprintf(shared->file_op, "%ld: %c %d: serving a service of type 3\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 8:
+    fprintf(shared->file_op, "%ld: %c %d: service finished\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 9:
+    fprintf(shared->file_op, "%ld: %c %d: going home\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 10:
+    fprintf(shared->file_op, "%ld: %c %d: taking break\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 11:
+    fprintf(shared->file_op, "%ld: %c %d: break finished\n", ++shared->rows, customer, id);
+    fflush(shared->file_op);
+    break;
+  case 12:
+    fprintf(shared->file_op, "%ld: closing\n", ++shared->rows);
+    fflush(shared->file_op);
+    break;
+  }
+  sem_post(&shared->print_lock);
+  sem_post(&shared->out);
+}
+
+void customer(int id, int TZ, shared_t *shared) {
+  char customer = 'Z';
+  srand(time(NULL) ^ (getpid() << 16)); // random queues
+  int action_type = (rand() % 3);
+
+  // starting
+  print_to_file(shared, id, customer, 0);
+  rand_sleep(TZ);
+
+  if (read_post_office(shared)) {
+    // customer going to queue
+    sem_wait(&shared->queue[action_type].id);
+    print_to_file(shared, id, customer, action_type + 1);
+    shared->queue[action_type].customers_in_queue++;
+    sem_post(&shared->queue[action_type].id);
+    sem_post(&shared->post_lock);
+
+    // waiting
+    sem_wait(&shared->queue[action_type].semaphore);
+
+    // called by officer
+    print_to_file(shared, id, customer, 4);
+    rand_sleep(10);
+  }
+  // going home
+  print_to_file(shared, id, customer, 9);
+  exit(EXIT_SUCCESS);
+}
+
+void officer(int id, int TU, shared_t *shared) {
+  char officer = 'U';
+  // officer started
+  print_to_file(shared, id, officer, 0);
+
+  while (true) {
+    sem_post(&shared->post_lock);
+    int queue_order = check_queue(shared);
+    if (queue_order >= 0) {
+      sem_post(&shared->queue[queue_order].semaphore);
+      // serving a service
+      print_to_file(shared, id, officer, queue_order + 5);
+      rand_sleep(10);
+      // finished
+      print_to_file(shared, id, officer, 8);
+    }
+    if (queue_order == -1 && (read_post_office(shared)) == true) {
+      // taking break
+      print_to_file(shared, id, officer, 10);
+      sem_post(&shared->post_lock);
+      rand_sleep(TU);
+      // break finished
+      print_to_file(shared, id, officer, 11);
+    }
+    if (queue_order == -1 && (read_post_office(shared)) == false) {
+      // closing
+      break;
+    }
+
+  } // end of while
+  // going home
+  print_to_file(shared, id, officer, 9);
+  exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 6) {
+    fprintf(stderr, "invalid amount of arguments given\n");
+    exit(EXIT_FAILURE);
+  }
+  // checking the arguments
+  char *block;
+  int nz = (int)strtol(argv[1], &block, 0);
+  if (*block != '\0' || nz < 0) {
+    fprintf(stderr, "arguments must be numeric\n");
+    exit(EXIT_FAILURE);
+  }
+
+  int nu = (int)strtol(argv[2], &block, 0);
+  if (*block != '\0' || nu < 0) {
+    fprintf(stderr, "arguments must be numeric\n");
+    exit(EXIT_FAILURE);
+  }
+
+  int tz = (int)strtol(argv[3], &block, 0);
+  if (*block != '\0' || tz < 0) {
+    fprintf(stderr, "arguments must be numeric\n");
+    exit(EXIT_FAILURE);
+  }
+
+  int tu = (int)strtol(argv[4], &block, 0);
+  if (*block != '\0' || tu < 0) {
+    fprintf(stderr, "arguments must be numeric\n");
+    exit(EXIT_FAILURE);
+  }
+  int f = (int)strtol(argv[5], &block, 0);
+  if (*block != '\0' || f < 0) {
+    fprintf(stderr, "arguments must be numeric\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // parsing arguments
+  int TZ = atoi(argv[3]);
+  int TU = atoi(argv[4]);
+  int F = atoi(argv[5]);
+
+  // check if arguments are in range
+  if (inRange(0, 10000, TZ) == false || inRange(0, 100, TU) == false || inRange(0, 10000, F) == false) {
+    fprintf(stderr, "wrong range of given arguments\n");
+    exit(EXIT_FAILURE);
+  }
+  // initializing random seed
+  srand(time(NULL));
+
+  // allocating the shared memory
+  shared_t *shared;
+  MMAP(shared);
+  // initialization of all semaphores
+  init_semaphores(shared);
+
+  // Opening the file
+  shared->file_op = fopen("proj2.out", "w");
+  if (shared->file_op == NULL) {
+    fprintf(stderr, "Error.\n");
+    return 1;
+  }
+
+  shared->post_office = true;
+  // parsing arguments
+  int cus_num = atoi(argv[1]);
+  int off_num = atoi(argv[2]);
+  shared->cus_num = atoi(argv[1]);
+  shared->off_num = atoi(argv[2]);
+
+  for (int i = 1; i <= cus_num; i++) {
+    pid_t id = fork();
+    if (id == 0) {
+      customer(i, TZ, shared);
+      exit(EXIT_SUCCESS);
+    } else if (id < 0) {
+      fprintf(stderr, "the fork failed");
+      fclose(shared->file_op);
+      UNMAP(shared);
+      destroy_semaphores(shared);
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  for (int i = 1; i <= off_num; i++) {
+    pid_t id = fork();
+    if (id == 0) {
+      officer(i, TU, shared);
+      exit(EXIT_SUCCESS);
+    } else if (id < 0) {
+      fprintf(stderr, "the fork failed");
+      fclose(shared->file_op);
+      UNMAP(shared);
+      destroy_semaphores(shared);
+      exit(EXIT_FAILURE);
+    }
+  }
+  int F_02 = F * 1000;
+  if (F_02 != 0) {
+    int random_time = rand() % (F_02 / 2) + (F_02 / 2); // generate a random number between F/2 and F
+    random_time = (random_time / 1000);
+    usleep(random_time);
+  }
+  sem_wait(&shared->post_lock);
+  print_to_file(shared, 0, ' ', 12);
+  shared->post_office = false;
+  sem_post(&shared->post_lock);
+
+  // waiting for all processes to finish
+  while (wait(NULL) > 0)
+    ;
+
+  fclose(shared->file_op);
+  UNMAP(shared);
+  destroy_semaphores(shared);
+
+  exit(0);
+}
