@@ -1,0 +1,336 @@
+#!/bin/sh
+export POSIXLY_CORRECT=yes
+
+M=0
+G=0
+A=0
+B=0
+list=0
+log=0
+F=0
+
+
+##Help
+help() {
+        echo "mole -h
+mole [-g GROUP] FILE
+mole [-m] [FILTERS] [DIRECTORY]
+mole list [FILTERS] [DIRECTORY] "
+}
+
+if [ "$MOLE_RC" = "" ]; then
+        echo "MOLE_RC variable not set."
+fi
+
+if [ ! -f "$MOLE_RC" ]; then
+        mkdir -p "$(dirname "$MOLE_RC")"
+        touch "$MOLE_RC"
+fi
+
+if [ "$1" = "list" ]; then
+        list=1
+        shift
+elif [ "$1" = "secret-log" ]; then
+        log=1
+        shift
+fi
+
+while getopts "hg:ma:b:" arg; do
+        case ${arg} in
+        h)
+                help
+                exit 0
+                ;;
+        g)
+                G=$((G + 1))
+                GROUP=$OPTARG
+                ;;
+        m)
+                M=$((M + 1))
+                ;;
+        a)
+                A=$((A + 1))
+                DATE01=$OPTARG
+                UNIX_DATE01=$(date -d "$DATE01" +"%s")
+                ;;
+        b)
+                B=$((B + 1))
+                DATE02=$OPTARG
+                UNIX_DATE02=$(date -d "$DATE02" +"%s")
+                ;;
+        *) ;;
+        esac
+done
+shift "$((OPTIND - 1))"
+
+if [ ! -d "$HOME/.mole/" ]; then
+        mkdir -p "$HOME/.mole/"
+fi
+secret_log() {
+        arg1="$1"
+        
+        if ! [ -d "/home/$USER/.mole" ]; then
+                mkdir "/home/$USER/.mole"
+        fi
+
+        echo "$arg1" | bzip2 -z >>"/home/$USER/.mole/log_$USER_$(date "+%Y-%m-%d_%H-%M-%S").bz2"
+}
+
+groups() {
+        arg1="$1"
+        molerc="$(cat "$MOLE_RC")"
+
+        if [ -n "$2" ]; then
+                molerc="$2"
+        fi
+
+        groups_file=""
+
+        while IFS='' read -r group; do
+                if [ -n "$(echo "$molerc" | grep ";$group;")" ]; then
+                        groups_file="$groups_file\n$(echo "$molerc" | grep ";$group;")"
+                fi
+        done <<-EOT
+$(echo "$arg1" | tr ',' '\n')
+EOT
+
+        groups_file="$(echo "$groups_file" | tail -n +2)"
+
+        cut_groups_file=$(echo "$groups_file" | awk -F ';' '{print $3}')
+
+}
+
+##get_after
+after_time() {
+        arg1="$1"
+        molerc="$(cat "$MOLE_RC")"
+
+        if [ -n "$2" ]; then
+                molerc="$2"
+        fi
+
+        if [ $A -gt 0 ]; then
+          files_after_time=""
+
+          while IFS='' read -r line; do
+            file_time=$(echo "$line" | awk -F ';' '{print $1}')
+            if [ "$file_time" -gt "$arg1" ]; then
+              files_after_time="$files_after_time\n$line"
+            fi
+          done<<-EOT
+$molerc
+EOT
+        fi
+
+        files_after_time="$(echo "$files_after_time" | tail -n +2)"
+}
+
+##get_before
+before_time() {
+        arg1="$1"
+        molerc="$(cat "$MOLE_RC")"
+
+        if [ -n "$2" ]; then
+                molerc="$2"
+        fi
+
+        if [ $B -gt 0 ]; then
+          files_before_time=""
+
+          while IFS='' read -r line; do
+            file_time=$(echo "$line" | awk -F ';' '{print $1}')
+            if [ "$file_time" -lt "$arg1" ]; then
+              files_before_time="$files_before_time\n$line"
+            fi
+          done<<-EOT
+$molerc
+EOT
+        fi
+
+        files_before_time="$(echo "$files_before_time" | tail -n +2)"
+}
+
+mole_rc="$(cat "$MOLE_RC")"
+
+if [ $A -gt 0 ]; then
+        after_time "$UNIX_DATE01" "$mole_rc"
+        mole_rc="$files_after_time"
+fi
+if [ $B -gt 0 ]; then
+        before_time "$UNIX_DATE02" "$mole_rc"
+        mole_rc="$files_before_time"
+fi
+if [ $G -gt 0 ]; then
+        groups "$GROUP" "$mole_rc"
+        mole_rc="$groups_file"
+fi
+
+##find_latest
+if [ -n "$1" ]; then
+        pathFile="$(realpath "$1")"
+fi
+
+#file
+if [ -f "$pathFile" ] && [ $list -lt 1 ] && [ $log -lt 1 ]; then
+        date=$(date +%s)
+        echo "$date;$GROUP;$(realpath "$pathFile")" >>"$MOLE_RC"
+
+        if [ -n "$EDITOR" ]; then
+                "$EDITOR" "$pathFile"
+        elif [ -n "$VISUAL" ]; then
+                "$VISUAL" "$pathFile"
+        else
+                vi "$pathFile"
+        fi
+        exit
+##dir
+elif [ $list -lt 1 ] && [ $log -lt 1 ]; then
+        dir="$pathFile"
+        if [ ! -d "$dir" ]; then
+                dir="$(pwd)"
+        fi
+
+        files="$mole_rc"
+        files_in_directory=""
+
+        while IFS='' read -r lines; do
+                file_directory=$(dirname "$(echo "$lines" | awk -F ';' '{print $3}')")
+                if [ "$file_directory" = "$dir" ]; then
+                        files_in_directory="$files_in_directory\n$lines"
+                fi
+        done <<-EOT
+$files
+EOT
+
+        files_in_directory="$(echo "$files_in_directory" | tail -n +2)"
+
+        if [ $M -gt 0 ]; then
+                files_in_directory_cut=$(echo "$files_in_directory" | awk -F ';' '{print $3}')
+                file_count=$(echo "$files_in_directory_cut" | sort | uniq -c | sed 's/^ *//' | sort -bgr)
+                most_used_file=$(echo "$file_count" | cut -d ' ' -f 2 | head -n 1)
+                wanted_file_cut="$most_used_file"
+        else
+                wanted_file=$(echo "$files_in_directory" | tr ' ' '\n' | tail -n 1)
+                wanted_file_cut=$(echo "$wanted_file" | awk -F ';' '{print $3 "\n"}')
+        fi
+
+        if [ ! -f "$wanted_file_cut" ]; then
+                echo "file not found"
+                exit 1
+        fi
+
+        date=$(date +%s)
+        echo "$date;$GROUP;$(realpath "$wanted_file_cut")" >>"$MOLE_RC"
+
+        if [ -n "$EDITOR" ]; then
+                "$EDITOR" "$wanted_file_cut"
+        elif [ -n "$VISUAL" ]; then
+                "$VISUAL" "$wanted_file_cut"
+        else
+                vi "$wanted_file_cut"
+        fi
+        exit
+
+elif [ "$M" -lt 1 ] && [ $list -lt 1 ] && [ $log -lt 1 ]; then
+        F=$((F + 1))
+        echo "uhhh zly file"
+fi
+
+##list
+if [ $list -gt 0 ] && [ $log -lt 1 ]; then
+        dir="$pathFile"
+        if [ ! -d "$dir" ]; then
+                dir="$(pwd)"
+        fi
+
+        files="$mole_rc"
+        files_in_directory=""
+
+        while IFS='' read -r lines; do
+                file_directory=$(dirname "$(echo "$lines" | awk -F ';' '{print $3}')")
+                if [ "$file_directory" = "$dir" ]; then
+                        files_in_directory="$files_in_directory\n$lines"
+                fi
+        done <<-EOT
+$files
+EOT
+        files_in_directory="$(echo "$files_in_directory" | tail -n +2)"
+
+        short_MoleRC="$files_in_directory"
+        file_names=$(echo "$short_MoleRC" | awk -F ';' '{print $3}')
+
+        output=""
+
+        if [ -z "$file_names" ]; then
+                exit 0
+        fi
+
+        while IFS='' read -r lines; do
+                groups=$(echo "$short_MoleRC" | awk -F ';' -v lines="$lines" '{ if ($3 ==  lines) print $2; }')
+                if [ -z "$groups" ]; then
+                        groups="-"
+                fi
+                newGroups=$(echo "$groups" | tr "," "\n" | sort | uniq | tr "\n" "," | sed 's/.$//')
+                lines=$(echo $lines | rev | cut -d '/' -f 1 | rev)
+                newGroups=$(echo "$newGroups" | sed 's/^,//g')
+
+                output="$(printf '%s\n%s:;%s' "$output" "$lines" "$newGroups")"
+        done <<-EOT
+$(echo "$file_names" | sort | uniq)
+EOT
+        echo "$output" | sort -f | column -t -s ";"
+fi
+
+#secretlog
+if [ $log -gt 0 ]; then
+        dirs="$1"
+        while true; do
+        shift 1
+          if [ -n "$1" ]; then
+            dirs="$dirs\n$1"
+          else 
+            break
+          fi
+        done
+
+        dirs="$(echo "$dirs" | tail -n +1)"
+
+        if [ -z "$dirs" ]; then
+                dirs="$(pwd)"
+        fi
+
+        files="$mole_rc"
+        files_in_directory=""
+        while IFS='' read -r lines; do
+                file_directory=$(dirname "$(echo "$lines" | awk -F ';' '{print $3}')")
+                while IFS='' read -r dir; do
+                  if [ "$file_directory" = "$(realpath "$dir")" ]; then
+                        files_in_directory="$files_in_directory\n$lines"
+                fi
+                done<<-EOT
+$dirs
+EOT
+                
+        done <<-EOT
+$files
+EOT
+        files_in_directory="$(echo "$files_in_directory" | tail -n +2)"
+        
+        short_MoleRC="$files_in_directory"
+        file_names=$(echo "$short_MoleRC" | awk -F ';' '{print $3}')
+
+        output=""
+
+        while IFS='' read -r lines; do
+                datetime=$(echo "$short_MoleRC" | awk -F ';' -v lines="$lines" '{ if ($3 ==  lines) print $1; }')
+                new_datetime=$(echo "$datetime" | tr "," "\n" | sort | uniq | tr "\n" "," | sed 's/.$//')
+                # lines=$(echo $lines | rev | cut -d '/' -f 1 | rev)
+                new_datetime=$(echo "$new_datetime" | sed 's/^,//g')
+
+                output="$(printf '%s\n%s;%s' "$output" "$lines" "$new_datetime")"
+        done <<-EOT
+$(echo "$file_names" | sort | uniq)
+EOT
+        output="$(echo "$output" | sort | tail -n +2)"
+        secret_log "$output"
+fi
